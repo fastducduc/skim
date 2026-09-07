@@ -16,6 +16,13 @@
 #include <limits.h>
 #include <time.h>
 
+#ifndef FZF_NATIVE_SOURCE_REVISION
+#define FZF_NATIVE_SOURCE_REVISION "unknown"
+#endif
+#ifndef FZF_NATIVE_SOURCE_BUILD_ID
+#define FZF_NATIVE_SOURCE_BUILD_ID "unknown"
+#endif
+
 enum { DEFAULT_TIMEOUT_MS = 120000 };
 
 typedef struct {
@@ -228,19 +235,20 @@ static bool parse_options(int argc, char **argv, Options *options) {
       return false;
     }
   }
-  return options->input && options->queries.count >= 2;
+  return options->input && options->queries.count >= 1;
 }
 
 static AsyncSession *session_create(const Options *options) {
   AsyncSession *session = calloc(1, sizeof *session);
   if (!session) return NULL;
   pthread_mutex_init(&session->mu, NULL);
+  pthread_mutex_init(&session->child_mu, NULL);
   pthread_mutex_init(&session->score_req_mu, NULL);
   pthread_cond_init(&session->score_req_cond, NULL);
   pthread_mutex_init(&session->score_res_mu, NULL);
   atomic_store(&session->child_owner, AsyncChildUnclaimed);
   atomic_store(&session->producer_state, AsyncProducerComplete);
-  atomic_store(&session->producer_error_kind, AsyncProducerErrorNone);
+  atomic_store(&session->producer_error, 0);
   atomic_store(&session->producer_exit_status, 0);
   atomic_store(&session->reader_done, true);
   cache_init(&session->cache, options->cache_entries);
@@ -251,6 +259,7 @@ static AsyncSession *session_create(const Options *options) {
     async_session_destroy(session);
     return NULL;
   }
+  session->worker_pool_owned = true;
   if (pthread_create(&session->score_thread, NULL, scoring_thread_fn,
                      session) != 0) {
     async_session_destroy(session);
@@ -277,7 +286,7 @@ static bool load_candidates(AsyncSession *session, const char *path,
       break;
     }
     len = async_strip_ansi(line, len);
-    if (len && !async_append_candidate(session, line, len)) {
+    if (!async_append_candidate(session, line, len)) {
       ok = false;
       break;
     }
@@ -445,23 +454,28 @@ static bool capture_round(AsyncSession *session, const Options *options,
   size_t limit = 0, progress_completed = 0, progress_total = 0;
   size_t filtered = 0, total = 0;
   uint64_t result_id = 0, generation = 0, error_id = 0;
+  AsyncResultObservation result_observation = {0};
   char *result_filter = NULL, *error = NULL;
   fzf_case_types case_mode = CaseSmart;
   bool fuzzy = true;
+  bool allocation_failed = false;
   ScoredStr *results = async_copy_public_result(
-      session, &round->emitted, &result_id, &result_filter, &limit,
-      &case_mode, &fuzzy, &round->filter_only, &round->pool, &generation,
+      session, true, &round->emitted, &result_observation, &result_filter,
+      &limit, &case_mode, &fuzzy, &round->filter_only, &generation,
       &progress_completed, &progress_total, &error_id, &error, &filtered,
-      &total);
+      &total, &allocation_failed);
+  result_id = result_observation.request_id;
+  round->pool = result_observation.pool_generation;
   bool ok = result_id == request_id && !error && round->pool == pool &&
-            total == pool && (!round->emitted || results) &&
+            total == pool && !allocation_failed &&
+            (!round->emitted || results) &&
             progress_completed == progress_total &&
             case_mode == options->case_mode && fuzzy == options->fuzzy &&
             (!limit || round->emitted <= limit);
   free(result_filter);
   free(error);
   if (!ok || !wait_for_idle(session, options->timeout_ms)) {
-    free(results);
+    async_free_public_result(results, round->emitted);
     return false;
   }
   round->request_id = request_id;
@@ -496,8 +510,10 @@ int main(int argc, char **argv) {
   }
 
   printf("{\"event\":\"ready\",\"protocol\":1,\"items\":%zu,"
-         "\"rounds\":%zu,\"workers\":%u,\"limit\":%zu}\n",
-         item_count, options.queries.count, options.workers, options.limit);
+         "\"rounds\":%zu,\"workers\":%u,\"limit\":%zu,"
+         "\"source_revision\":\"%s\",\"source_build_id\":\"%s\"}\n",
+         item_count, options.queries.count, options.workers, options.limit,
+         FZF_NATIVE_SOURCE_REVISION, FZF_NATIVE_SOURCE_BUILD_ID);
   fflush(stdout);
 
   RoundResult *rounds = calloc(options.queries.count, sizeof *rounds);
@@ -511,7 +527,7 @@ int main(int argc, char **argv) {
   if (!ok) {
     emit_error("session-or-verification-failed");
     for (size_t i = 0; rounds && i < options.queries.count; i++)
-      free(rounds[i].results);
+      async_free_public_result(rounds[i].results, rounds[i].emitted);
     free(rounds);
     async_session_destroy(session);
     queries_free(&options.queries);
@@ -539,11 +555,14 @@ int main(int argc, char **argv) {
   printf("{\"event\":\"complete\",\"protocol\":1,\"items\":%zu,"
          "\"rounds\":%zu,\"total_elapsed_ns\":%" PRIu64
          ",\"aggregate_checksum\":\"%016" PRIx64
-         "\",\"verified\":true}\n",
-         item_count, options.queries.count, total_ns, aggregate);
+         "\",\"source_revision\":\"%s\",\"source_build_id\":\"%s\","
+         "\"verified\":true}\n",
+         item_count, options.queries.count, total_ns, aggregate,
+         FZF_NATIVE_SOURCE_REVISION, FZF_NATIVE_SOURCE_BUILD_ID);
   fflush(stdout);
 
-  for (size_t i = 0; i < options.queries.count; i++) free(rounds[i].results);
+  for (size_t i = 0; i < options.queries.count; i++)
+    async_free_public_result(rounds[i].results, rounds[i].emitted);
   free(rounds);
   async_session_destroy(session);
   queries_free(&options.queries);

@@ -35,9 +35,16 @@ fi
 required=(
   emacs-module.h
   fzf-native-module.c
+  fzf.h
   fzf-additions.c
+  fzf-additions.h
+  fzf-private.h
   fzf.c
+  fzf-score-input.inc
+  utf8_char_index.h
   utf8proc-2.10.0/utf8proc.c
+  utf8proc-2.10.0/utf8proc.h
+  utf8proc-2.10.0/utf8proc_data.c
 )
 for file in "${required[@]}"; do
   if [[ ! -f "$source_dir/$file" ]]; then
@@ -46,10 +53,23 @@ for file in "${required[@]}"; do
   fi
 done
 
+if ! source_revision="$(git -C "$source_dir" rev-parse --verify HEAD 2>/dev/null)"; then
+  echo "fzf-native source must be a Git checkout so its exact revision can be reported." >&2
+  exit 2
+fi
+source_manifest=""
+for file in "${required[@]}"; do
+  blob_id="$(git hash-object "$source_dir/$file")"
+  source_manifest+="$file $blob_id"$'\n'
+done
+source_build_id="$(printf '%s' "$source_manifest" | git hash-object --stdin)"
+
 mkdir -p "$(dirname "$output")"
 cc_args=(
   -std=gnu11 -O3 -DNDEBUG -Wall -Wextra -pthread
   -I"$source_dir" -I"$source_dir/utf8proc-2.10.0"
+  "-DFZF_NATIVE_SOURCE_REVISION=\"$source_revision\""
+  "-DFZF_NATIVE_SOURCE_BUILD_ID=\"$source_build_id\""
 )
 if [[ -n "${FZF_NATIVE_DRIVER_CFLAGS:-}" ]]; then
   read -r -a extra_flags <<< "$FZF_NATIVE_DRIVER_CFLAGS"

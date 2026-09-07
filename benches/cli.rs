@@ -14,8 +14,8 @@ use clap::Parser;
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufWriter, Result, Write};
-use std::path::Path;
+use std::io::{BufWriter, Error, ErrorKind, Result, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -100,6 +100,9 @@ enum Subcommand {
     /// Run the benchmark
     #[command(alias = "r")]
     Run(RunArgs),
+
+    /// Benchmark fzf-native's persistent session over successive prefixes of the CLI query
+    NativeSession(NativeSessionArgs),
 
     /// Plot results from a JSON file produced by one (or multiple concatenated) `run --json` calls
     Plot(PlotArgs),
@@ -207,6 +210,53 @@ struct RunArgs {
     /// Pass remaining arguments to the benchmarked binary
     #[arg(last = true)]
     extra_args: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+struct NativeSessionArgs {
+    /// fzf-native source checkout. May also be set with FZF_NATIVE_DIR.
+    #[arg(long, value_name = "DIR")]
+    fzf_native_dir: Option<String>,
+
+    /// Use an already-built native session driver instead of compiling one.
+    #[arg(long, value_name = "FILE")]
+    driver: Option<String>,
+
+    /// Number of items to generate with the same generator as `run`.
+    #[arg(short = 'n', long, default_value_t = DEFAULT_NUM_ITEMS, value_name = "NUM")]
+    num_items: u64,
+
+    /// Query typed into the session. Each successive character prefix is one update round.
+    #[arg(short = 'q', long, default_value = DEFAULT_QUERY)]
+    query: String,
+
+    /// Number of measured session runs.
+    #[arg(short = 'r', long, default_value_t = 1u32, value_name = "RUNS")]
+    runs: u32,
+
+    /// Number of complete warmup session runs.
+    #[arg(short = 'w', long, default_value_t = 1u32, value_name = "N")]
+    warmup: u32,
+
+    /// Use an existing CLI benchmark fixture instead of generating input.
+    #[arg(short = 'f', long, value_name = "FILE")]
+    file: Option<String>,
+
+    /// Published top-result limit checked after every round.
+    #[arg(long, default_value_t = 10_000usize, value_name = "N")]
+    limit: usize,
+
+    /// Persistent native scorer thread count (default: fzf-native auto-detection).
+    #[arg(long, value_name = "N")]
+    workers: Option<u32>,
+
+    /// Hard timeout for each query update.
+    #[arg(long, default_value_t = 120_000u64, value_name = "MS")]
+    timeout_ms: u64,
+
+    /// Pass remaining session settings to the C driver.
+    #[arg(last = true)]
+    driver_args: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1565,6 +1615,296 @@ fn cmd_plot(args: &PlotArgs) -> std::result::Result<(), Box<dyn std::error::Erro
 }
 
 // ---------------------------------------------------------------------------
+// fzf-native multi-round session integration
+// ---------------------------------------------------------------------------
+
+fn invalid_data(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidData, message.into())
+}
+
+fn query_prefixes(query: &str) -> Vec<&str> {
+    if query.is_empty() {
+        return vec![query];
+    }
+    query
+        .char_indices()
+        .map(|(start, ch)| &query[..start + ch.len_utf8()])
+        .collect()
+}
+
+fn resolve_native_driver(args: &NativeSessionArgs) -> Result<PathBuf> {
+    if let Some(ref driver) = args.driver {
+        return which::which(driver)
+            .map_err(|error| invalid_data(format!("cannot resolve driver '{driver}': {error}")));
+    }
+
+    let source = args
+        .fzf_native_dir
+        .clone()
+        .or_else(|| std::env::var("FZF_NATIVE_DIR").ok())
+        .ok_or_else(|| invalid_data("pass --fzf-native-dir or set FZF_NATIVE_DIR"))?;
+    if !Path::new(&source).is_dir() {
+        return Err(invalid_data(format!("fzf-native source directory not found: {source}")));
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("benches/build_fzf_native_session_driver.sh");
+    let driver = root.join("target/fzf-native-session-driver");
+    let output = Command::new(&script)
+        .args(["--source", &source, "--output"])
+        .arg(&driver)
+        .output()?;
+    if !output.status.success() {
+        return Err(invalid_data(format!(
+            "failed to build fzf-native session driver (status {}):\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    if !driver.is_file() {
+        return Err(invalid_data("driver build succeeded without producing its executable"));
+    }
+    Ok(driver)
+}
+
+fn json_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid_data(format!("protocol record has no unsigned '{field}'")))
+}
+
+fn json_build_identity(value: &serde_json::Value) -> Result<(String, String)> {
+    let read_hex = |field: &str| -> Result<String> {
+        let identity = value
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_data(format!("protocol record has no '{field}'")))?;
+        if identity.len() != 40 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(invalid_data(format!("protocol record has invalid '{field}'")));
+        }
+        Ok(identity.to_owned())
+    };
+    Ok((read_hex("source_revision")?, read_hex("source_build_id")?))
+}
+
+fn json_hex_u64(value: &serde_json::Value, field: &str) -> Result<u64> {
+    let hex = value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_data(format!("protocol record has no '{field}'")))?;
+    if hex.len() != 16 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid_data(format!("protocol record has invalid '{field}'")));
+    }
+    u64::from_str_radix(hex, 16)
+        .map_err(|error| invalid_data(format!("protocol record has invalid '{field}': {error}")))
+}
+
+fn native_hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
+fn validate_native_protocol(
+    output: &[u8],
+    expected_items: u64,
+    queries: &[&str],
+    limit: usize,
+    expected_workers: Option<u32>,
+) -> Result<()> {
+    let text =
+        std::str::from_utf8(output).map_err(|error| invalid_data(format!("driver output is not UTF-8: {error}")))?;
+    let mut ready = false;
+    let mut complete = false;
+    let mut rounds = 0usize;
+    let mut elapsed_sum = 0u64;
+    let mut last_request_id = 0u64;
+    let mut aggregate_checksum = 1_469_598_103_934_665_603u64;
+    let mut build_identity: Option<(String, String)> = None;
+
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| invalid_data(format!("invalid driver JSONL record: {error}: {line}")))?;
+        if json_u64(&value, "protocol")? != 1 {
+            return Err(invalid_data("unsupported driver protocol"));
+        }
+        let event = value
+            .get("event")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| invalid_data("driver record has no event"))?;
+        match event {
+            "ready" => {
+                if ready || rounds != 0 || complete {
+                    return Err(invalid_data("misordered or duplicate ready record"));
+                }
+                if json_u64(&value, "items")? != expected_items
+                    || json_u64(&value, "rounds")? != queries.len() as u64
+                    || json_u64(&value, "limit")? != limit as u64
+                {
+                    return Err(invalid_data("ready record does not match the requested workload"));
+                }
+                let workers = json_u64(&value, "workers")?;
+                if workers == 0 || expected_workers.is_some_and(|expected| workers != u64::from(expected)) {
+                    return Err(invalid_data("ready record does not match the requested worker count"));
+                }
+                build_identity = Some(json_build_identity(&value)?);
+                ready = true;
+            }
+            "round" => {
+                if !ready || complete || value.get("verified").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return Err(invalid_data("unready, late, or unverified round record"));
+                }
+                rounds += 1;
+                if rounds > queries.len()
+                    || json_u64(&value, "round")? != rounds as u64
+                    || json_u64(&value, "items")? != expected_items
+                {
+                    return Err(invalid_data("round record does not match the requested workload"));
+                }
+                let expected_query_hash = native_hash_bytes(1_469_598_103_934_665_603, queries[rounds - 1].as_bytes());
+                if json_hex_u64(&value, "query_hash")? != expected_query_hash {
+                    return Err(invalid_data("round query hash does not match the requested query"));
+                }
+                let request_id = json_u64(&value, "request_id")?;
+                if request_id <= last_request_id {
+                    return Err(invalid_data("request IDs are not strictly increasing"));
+                }
+                last_request_id = request_id;
+                let matched = json_u64(&value, "matched")?;
+                let emitted = json_u64(&value, "emitted")?;
+                if emitted > matched || matched > expected_items || (limit != 0 && emitted > limit as u64) {
+                    return Err(invalid_data("invalid match counts in round record"));
+                }
+                if value.get("filter_only").and_then(serde_json::Value::as_bool).is_none() {
+                    return Err(invalid_data("round record has no Boolean 'filter_only'"));
+                }
+                let elapsed = json_u64(&value, "elapsed_ns")?;
+                if elapsed == 0 {
+                    return Err(invalid_data("round reported zero elapsed time"));
+                }
+                elapsed_sum = elapsed_sum
+                    .checked_add(elapsed)
+                    .ok_or_else(|| invalid_data("round elapsed-time sum overflowed"))?;
+                let checksum = json_hex_u64(&value, "checksum")?;
+                aggregate_checksum = native_hash_bytes(aggregate_checksum, &checksum.to_ne_bytes());
+            }
+            "complete" => {
+                if !ready
+                    || complete
+                    || rounds != queries.len()
+                    || value.get("verified").and_then(serde_json::Value::as_bool) != Some(true)
+                    || json_u64(&value, "items")? != expected_items
+                    || json_u64(&value, "rounds")? != queries.len() as u64
+                    || json_u64(&value, "total_elapsed_ns")? != elapsed_sum
+                {
+                    return Err(invalid_data("completion record is inconsistent or unverified"));
+                }
+                if json_hex_u64(&value, "aggregate_checksum")? != aggregate_checksum {
+                    return Err(invalid_data("completion aggregate checksum does not match the rounds"));
+                }
+                if build_identity.as_ref() != Some(&json_build_identity(&value)?) {
+                    return Err(invalid_data("completion build identity differs from readiness"));
+                }
+                complete = true;
+            }
+            "error" => {
+                let code = value
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(invalid_data(format!("fzf-native driver reported error: {code}")));
+            }
+            other => return Err(invalid_data(format!("unknown driver protocol event: {other}"))),
+        }
+    }
+    if !ready || !complete || rounds != queries.len() {
+        return Err(invalid_data(
+            "driver output is missing verified readiness, rounds, or completion",
+        ));
+    }
+    Ok(())
+}
+
+fn run_native_driver(
+    driver: &Path,
+    input: &str,
+    item_count: u64,
+    queries: &[&str],
+    args: &NativeSessionArgs,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new(driver);
+    command
+        .args(["--input", input, "--limit", &args.limit.to_string(), "--timeout-ms"])
+        .arg(args.timeout_ms.to_string());
+    if let Some(workers) = args.workers {
+        command.args(["--workers", &workers.to_string()]);
+    }
+    for query in queries {
+        command.args(["--query", query]);
+    }
+    command.args(&args.driver_args);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(invalid_data(format!(
+            "fzf-native driver failed (status {}):\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    validate_native_protocol(&output.stdout, item_count, queries, args.limit, args.workers)?;
+    Ok(output.stdout)
+}
+
+fn cmd_native_session(args: &NativeSessionArgs) -> Result<()> {
+    if args.runs == 0 {
+        return Err(invalid_data("--runs must be greater than zero"));
+    }
+    let driver = resolve_native_driver(args)?;
+    let (input, _input_handle, item_count) = if let Some(ref path) = args.file {
+        if !Path::new(path).is_file() {
+            return Err(invalid_data(format!("input file not found: {path}")));
+        }
+        let count = fs::read_to_string(path)?.lines().count() as u64;
+        (path.clone(), None::<NamedTempFile>, count)
+    } else {
+        let temp = NamedTempFile::new()?;
+        let path = temp.path().to_string_lossy().into_owned();
+        generate_test_data(&path, args.num_items)?;
+        (path, Some(temp), args.num_items)
+    };
+    if item_count == 0 {
+        return Err(invalid_data("input corpus is empty"));
+    }
+
+    let queries = query_prefixes(&args.query);
+    eprintln!(
+        "=== fzf-native multi-round session benchmark ===\nDriver: {} | Items: {} | Query: '{}' | Rounds: {} | Warmup: {} | Runs: {}",
+        driver.display(),
+        item_count,
+        args.query,
+        queries.len(),
+        args.warmup,
+        args.runs
+    );
+    for warmup in 1..=args.warmup {
+        eprintln!("Warmup {}/{} ...", warmup, args.warmup);
+        let _ = run_native_driver(&driver, &input, item_count, &queries, args)?;
+    }
+    for run in 1..=args.runs {
+        eprintln!("Measured run {}/{} ...", run, args.runs);
+        let output = run_native_driver(&driver, &input, item_count, &queries, args)?;
+        std::io::stdout().write_all(&output)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1586,6 +1926,13 @@ fn main() -> Result<()> {
         Subcommand::Plot(ref p) => {
             if let Err(e) = cmd_plot(p) {
                 eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Subcommand::NativeSession(ref native) => {
+            if let Err(error) = cmd_native_session(native) {
+                eprintln!("Error: {error}");
                 std::process::exit(1);
             }
             return Ok(());

@@ -777,40 +777,75 @@ Binary names are resolved to absolute paths via `which` before use, so bare name
 
 ## fzf-native multi-round session benchmark
 
-`benches/fzf_native_session_driver.c` benchmarks the plain-C interactive
-session implemented by fzf-native. It is separate from the `cli` benchmark
-above: the existing generated corpora, query, terminal polling, and timing
-boundaries are unchanged.
+`cargo bench --bench cli -- native-session` benchmarks the plain-C interactive
+session implemented by fzf-native. This subcommand is part of the registered
+`cli` benchmark target. The existing `run` competitors, terminal polling, and
+timing boundaries are unchanged.
 
-Build the driver against a chosen fzf-native source checkout, then pass the
-corpus and complete query sequence explicitly:
+The subcommand uses the same corpus generator and default query (`test`) as
+`run`. Each character prefix is one native query-update round. For `test`, the
+prefix sequence is `t`, `te`, `tes`, and `test`. This sequence matches the
+characters typed into the interactive CLI.
+
+Set `--fzf-native-dir` to a chosen fzf-native source checkout. The target builds
+and runs the C executable. It generates the existing 1M-item workload, runs one
+warmup, and prints the validated JSONL result.
 
 ```sh
-benches/build_fzf_native_session_driver.sh --source /path/to/fzf-native
-target/fzf-native-session-driver \
-  --input benches/fixtures/1M.txt \
-  --query t --query te --query tes --query test
+cargo bench --bench cli -- native-session \
+  --fzf-native-dir /path/to/fzf-native
+```
+
+To compare a recorded workload, use an existing fixture and the normal `cli`
+query and run controls.
+
+```sh
+cargo bench --bench cli -- native-session \
+  --fzf-native-dir /path/to/fzf-native \
+  -f /path/to/existing-corpus.txt -q test -w 1 -r 5
 ```
 
 The driver loads the exact newline-delimited input before emitting a JSONL
 `ready` record. Each round measures from request submission until an
 authoritative result for that request and the complete input pool is published.
-After all timed rounds, an untimed full scan independently checks the match
-count and ordered top results for every query. Only then are `round` records
-and the final `complete` record emitted with `"verified":true`. Consumers must
-discard a run unless it exits successfully and has a verified `complete`
-record; an empty corpus, timeout, matcher error, stale result, or correctness
-mismatch produces only an `error` record and a non-zero exit.
+After all timed rounds, an untimed full scan compares the match count and
+ordered top results for every query. Then the driver emits the `round` records
+and the final `complete` record with `"verified":true`.
 
-At least two `--query` values are required. Use `--queries FILE` to preserve a
-longer workload exactly, including an empty-query round represented by a blank
-line. The session settings are CLI options; build locations can also be set
-with `FZF_NATIVE_DIR`, `FZF_NATIVE_DRIVER`, `CC`, and
-`FZF_NATIVE_DRIVER_CFLAGS`. Run the focused protocol smoke test with:
+Consumers must discard a run without a successful exit and a validated
+`complete` record. If the workload fails, the driver emits an `error` record and
+a nonzero exit. Failures include an empty corpus, a timeout, a matcher error, a
+stale result, and a correctness mismatch. A failed run has no `round` or
+`complete` record.
+
+The Cargo target validates the C process exit status and all required protocol
+fields. It validates item and round counts, request IDs, timings, match counts,
+query hashes, result checksums, and the completion totals. The target sends a
+measured run to stdout only after validation. Thus, a failed run sends no timing
+records to stdout.
+
+The `ready` and validated `complete` records include the full fzf-native Git
+revision. They include a build ID from every fzf-native source input. This build
+ID also uses the working-tree contents. Record both values with each published
+measurement.
+
+The reference source is `fastducduc/fzf-native` branch
+`codex/benchmark-baseline-20260906`. Its commit is
+`ae3e3e1e8d737949455210f9304dc726ba0e51a1`. If a compiled file differs from
+this commit, the build ID changes.
+
+You can also run the driver directly with a supplied query sequence. Use
+repeatable `--query` options or `--queries FILE`. A blank line in the file is an
+empty query. Use CLI options for the session settings. You can set build
+locations with `FZF_NATIVE_DIR`, `FZF_NATIVE_DRIVER`, `CC`, and
+`FZF_NATIVE_DRIVER_CFLAGS`.
+
+Run the focused protocol tests.
 
 ```sh
 benches/test_fzf_native_session_driver.sh \
   target/fzf-native-session-driver
+benches/test_fzf_native_cli.sh
 ```
 
 ### Criterion benchmarks
