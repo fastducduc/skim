@@ -57,6 +57,9 @@ typedef struct {
   bool fuzzy;
 } Options;
 
+/* Focused regression seam for the untimed verification oracle. */
+static bool verify_test_force_allocation_failure;
+
 static void usage(FILE *out, const char *argv0) {
   fprintf(out,
           "Usage: %s --input FILE (--query QUERY | --queries FILE)... [OPTIONS]\n"
@@ -376,10 +379,15 @@ static bool verify_round(AsyncSession *session, const Options *options,
   if (round->filter_only != expected_filter_only) return false;
 
   char *mutable_query = *query ? strdup(query) : NULL;
+  if (*query && !mutable_query) return false;
   fzf_pattern_t *pattern = mutable_query
                                ? fzf_parse_pattern(options->case_mode, false,
                                                    mutable_query, options->fuzzy)
                                : NULL;
+  if (mutable_query && !pattern) {
+    free(mutable_query);
+    return false;
+  }
   fzf_slab_t *slab = fzf_make_default_slab();
   ScoredStr *reference = malloc(round->pool * sizeof *reference);
   if ((!slab && pattern) || (round->pool && !reference)) {
@@ -391,6 +399,7 @@ static bool verify_round(AsyncSession *session, const Options *options,
   }
 
   size_t matched = 0;
+  bool matcher_allocation_failed = false;
   pthread_mutex_lock(&session->mu);
   for (size_t i = 0; i < round->pool; i++) {
     char *candidate = session->cands_top[i >> CANDS_BLOCK_SHIFT]
@@ -400,6 +409,11 @@ static bool verify_round(AsyncSession *session, const Options *options,
                     : round->filter_only
                           ? (fzf_has_match(candidate, pattern, slab) ? 1 : 0)
                           : fzf_get_score(candidate, pattern, slab);
+    if (pattern &&
+        (fzf_allocation_failed() || verify_test_force_allocation_failure)) {
+      matcher_allocation_failed = true;
+      break;
+    }
     if (score > 0)
       reference[matched++] = (ScoredStr){
           .str = candidate, .score = score, .idx = (uint32_t)i};
@@ -409,15 +423,22 @@ static bool verify_round(AsyncSession *session, const Options *options,
   size_t emitted = options->limit && options->limit < matched
                        ? options->limit
                        : matched;
-  if (round->filter_only && pattern) {
-    for (size_t i = 0; i < emitted; i++)
+  if (!matcher_allocation_failed && round->filter_only && pattern) {
+    for (size_t i = 0; i < emitted; i++) {
       reference[i].score = fzf_get_score(reference[i].str, pattern, slab);
-    qsort(reference, emitted, sizeof *reference, reference_cmp);
-  } else {
+      if (fzf_allocation_failed() || verify_test_force_allocation_failure) {
+        matcher_allocation_failed = true;
+        break;
+      }
+    }
+    if (!matcher_allocation_failed)
+      qsort(reference, emitted, sizeof *reference, reference_cmp);
+  } else if (!matcher_allocation_failed) {
     qsort(reference, matched, sizeof *reference, reference_cmp);
   }
 
-  bool ok = round->matched == matched && round->emitted == emitted;
+  bool ok = !matcher_allocation_failed && round->matched == matched &&
+            round->emitted == emitted;
   for (size_t i = 0; ok && i < emitted; i++) {
     ok = round->results[i].idx == reference[i].idx &&
          round->results[i].score == reference[i].score &&
@@ -494,6 +515,8 @@ static void emit_error(const char *code) {
 }
 
 int main(int argc, char **argv) {
+  verify_test_force_allocation_failure =
+      getenv("FZF_NATIVE_DRIVER_TEST_VERIFY_OOM") != NULL;
   Options options;
   if (!parse_options(argc, argv, &options)) {
     usage(stderr, argv[0]);

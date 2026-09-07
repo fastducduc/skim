@@ -25,6 +25,19 @@ complete_build_id="$(grep '"event":"complete"' "$work_dir/success.jsonl" | sed -
 [[ "$ready_revision" == "$complete_revision" ]]
 [[ "$ready_build_id" == "$complete_build_id" ]]
 
+if FZF_NATIVE_DRIVER_TEST_VERIFY_OOM=1 "$driver" \
+    --input "$work_dir/input.txt" --query a --workers 2 --limit 3 \
+    > "$work_dir/verify-oom.jsonl"; then
+  echo "verification matcher OOM unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q '"event":"error".*"session-or-verification-failed"' \
+  "$work_dir/verify-oom.jsonl"
+if grep -Eq '"event":"(round|complete)"' "$work_dir/verify-oom.jsonl"; then
+  echo "verification matcher OOM emitted validated timing output" >&2
+  exit 1
+fi
+
 : > "$work_dir/empty.txt"
 if "$driver" --input "$work_dir/empty.txt" --query a --query al \
     > "$work_dir/failure.jsonl"; then
