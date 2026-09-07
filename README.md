@@ -775,6 +775,44 @@ cargo bench --bench cli -- run sk -r 3 -- --tiebreak=index     # pass extra flag
 
 Binary names are resolved to absolute paths via `which` before use, so bare names like `sk` or `fzf` work as long as they are on `$PATH`.
 
+## fzf-native multi-round session benchmark
+
+`benches/fzf_native_session_driver.c` benchmarks the plain-C interactive
+session implemented by fzf-native. It is separate from the `cli` benchmark
+above: the existing generated corpora, query, terminal polling, and timing
+boundaries are unchanged.
+
+Build the driver against a chosen fzf-native source checkout, then pass the
+corpus and complete query sequence explicitly:
+
+```sh
+benches/build_fzf_native_session_driver.sh --source /path/to/fzf-native
+target/fzf-native-session-driver \
+  --input benches/fixtures/1M.txt \
+  --query t --query te --query tes --query test
+```
+
+The driver loads the exact newline-delimited input before emitting a JSONL
+`ready` record. Each round measures from request submission until an
+authoritative result for that request and the complete input pool is published.
+After all timed rounds, an untimed full scan independently checks the match
+count and ordered top results for every query. Only then are `round` records
+and the final `complete` record emitted with `"verified":true`. Consumers must
+discard a run unless it exits successfully and has a verified `complete`
+record; an empty corpus, timeout, matcher error, stale result, or correctness
+mismatch produces only an `error` record and a non-zero exit.
+
+At least two `--query` values are required. Use `--queries FILE` to preserve a
+longer workload exactly, including an empty-query round represented by a blank
+line. The session settings are CLI options; build locations can also be set
+with `FZF_NATIVE_DIR`, `FZF_NATIVE_DRIVER`, `CC`, and
+`FZF_NATIVE_DRIVER_CFLAGS`. Run the focused protocol smoke test with:
+
+```sh
+benches/test_fzf_native_session_driver.sh \
+  target/fzf-native-session-driver
+```
+
 ### Criterion benchmarks
 
 Criterion benchmarks are available to measure skim's performance more precisely.
