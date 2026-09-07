@@ -805,9 +805,27 @@ cargo bench --bench cli -- native-session \
   -f /path/to/existing-corpus.txt -q test -w 1 -r 5
 ```
 
+To measure deletions, revisits, or other non-prefix edits, pass an explicit
+trace to the same registered Cargo target. Each line is one query-update round;
+a blank line is an empty query. `--queries` and `--query` are mutually
+exclusive, and omitting both preserves the default `t`, `te`, `tes`, `test`
+prefix workload.
+
+```sh
+printf '%s\n' f fo foo fo f > /tmp/fzf-native-queries.txt
+cargo bench --bench cli -- native-session \
+  --fzf-native-dir /path/to/fzf-native \
+  -f /path/to/existing-corpus.txt \
+  --queries /tmp/fzf-native-queries.txt -w 1 -r 5
+```
+
 The driver loads the exact newline-delimited input before emitting a JSONL
 `ready` record. Each round measures from request submission until an
 authoritative result for that request and the complete input pool is published.
+The driver observes the session's compatibility generation with a requested
+1 microsecond sleep between checks, so reported time includes the platform's
+short-sleep wakeup latency. On macOS it uses the higher-resolution
+`CLOCK_UPTIME_RAW` clock for the timed interval.
 After all timed rounds, an untimed full scan compares the match count and
 ordered top results for every query. Then the driver emits the `round` records
 and the final `complete` record with `"verified":true`.
@@ -836,7 +854,9 @@ this commit, the build ID changes.
 
 You can also run the driver directly with a supplied query sequence. Use
 repeatable `--query` options or `--queries FILE`. A blank line in the file is an
-empty query. Use CLI options for the session settings. You can set build
+empty query. The registered Cargo target rejects consecutive duplicate queries
+because the session correctly treats the second request as an unmeasurable
+no-op. Use CLI options for the session settings. You can set build
 locations with `FZF_NATIVE_DIR`, `FZF_NATIVE_DRIVER`, `CC`, and
 `FZF_NATIVE_DRIVER_CFLAGS`.
 

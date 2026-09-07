@@ -227,8 +227,12 @@ struct NativeSessionArgs {
     num_items: u64,
 
     /// Query typed into the session. Each successive character prefix is one update round.
-    #[arg(short = 'q', long, default_value = DEFAULT_QUERY)]
-    query: String,
+    #[arg(short = 'q', long, value_name = "QUERY", conflicts_with = "queries")]
+    query: Option<String>,
+
+    /// File containing an explicit query-update trace, one round per line.
+    #[arg(long, value_name = "FILE", conflicts_with = "query")]
+    queries: Option<String>,
 
     /// Number of measured session runs.
     #[arg(short = 'r', long, default_value_t = 1u32, value_name = "RUNS")]
@@ -1632,6 +1636,21 @@ fn query_prefixes(query: &str) -> Vec<&str> {
         .collect()
 }
 
+fn read_query_trace(path: &str) -> Result<Vec<String>> {
+    let contents = fs::read_to_string(path)?;
+    let queries = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    if queries.is_empty() {
+        return Err(invalid_data("query trace is empty"));
+    }
+    if queries.iter().any(|query| query.contains('\0')) {
+        return Err(invalid_data("query trace contains a NUL byte"));
+    }
+    if queries.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_data("query trace contains consecutive duplicate queries"));
+    }
+    Ok(queries)
+}
+
 fn resolve_native_driver(args: &NativeSessionArgs) -> Result<PathBuf> {
     if let Some(ref driver) = args.driver {
         return which::which(driver)
@@ -1882,6 +1901,9 @@ fn cmd_native_session(args: &NativeSessionArgs) -> Result<()> {
     if args.runs == 0 {
         return Err(invalid_data("--runs must be greater than zero"));
     }
+    if args.query.is_some() && args.queries.is_some() {
+        return Err(invalid_data("--query cannot be used with --queries"));
+    }
     validate_native_driver_args(&args.driver_args)?;
     let driver = resolve_native_driver(args)?;
     let (input, _input_handle, item_count) = if let Some(ref path) = args.file {
@@ -1900,12 +1922,22 @@ fn cmd_native_session(args: &NativeSessionArgs) -> Result<()> {
         return Err(invalid_data("input corpus is empty"));
     }
 
-    let queries = query_prefixes(&args.query);
+    let query = args.query.as_deref().unwrap_or(DEFAULT_QUERY);
+    let trace = args.queries.as_deref().map(read_query_trace).transpose()?;
+    let queries = trace
+        .as_ref()
+        .map(|queries| queries.iter().map(String::as_str).collect::<Vec<_>>())
+        .unwrap_or_else(|| query_prefixes(query));
+    let workload = args
+        .queries
+        .as_deref()
+        .map(|path| format!("trace '{path}'"))
+        .unwrap_or_else(|| format!("query '{query}'"));
     eprintln!(
-        "=== fzf-native multi-round session benchmark ===\nDriver: {} | Items: {} | Query: '{}' | Rounds: {} | Warmup: {} | Runs: {}",
+        "=== fzf-native multi-round session benchmark ===\nDriver: {} | Items: {} | Workload: {} | Rounds: {} | Warmup: {} | Runs: {}",
         driver.display(),
         item_count,
-        args.query,
+        workload,
         queries.len(),
         args.warmup,
         args.runs

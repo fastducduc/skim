@@ -310,21 +310,47 @@ static uint64_t monotonic_ns(void) {
          (uint64_t)now.tv_nsec;
 }
 
+static uint64_t measurement_tick(void) {
+#ifdef __APPLE__
+  return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+  return monotonic_ns();
+#endif
+}
+
+static uint64_t elapsed_ns(uint64_t start, uint64_t end) {
+  if (!start || !end || end < start) return 0;
+  return end - start;
+}
+
 static bool wait_for_publication(AsyncSession *session, uint64_t request_id,
                                  size_t pool, uint64_t timeout_ms,
-                                 uint64_t start_ns) {
-  static const struct timespec pause = {.tv_sec = 0, .tv_nsec = 50000};
+                                 uint64_t timeout_start_ns,
+                                 int initial_generation) {
+  static const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000};
+  bool first_check = true;
+  int observed_generation = initial_generation;
   for (;;) {
-    pthread_mutex_lock(&session->score_res_mu);
-    bool failed = session->score_error_id == request_id;
-    bool complete = session->score_result_id == request_id &&
-                    session->score_result_pool_gen == pool;
-    pthread_mutex_unlock(&session->score_res_mu);
-    if (failed) return false;
-    if (complete) return true;
+    int generation = atomic_load_explicit(&session->gen, memory_order_acquire);
+    if (generation != observed_generation || first_check) {
+      pthread_mutex_lock(&session->score_res_mu);
+      bool failed = session->score_error_id == request_id;
+      bool complete = session->score_result_id == request_id &&
+                      session->score_result_pool_gen == pool;
+      pthread_mutex_unlock(&session->score_res_mu);
+      if (failed) return false;
+      if (complete) return true;
+      observed_generation = generation;
+      first_check = false;
+    }
+
     uint64_t now = monotonic_ns();
-    if (!now || now - start_ns >= timeout_ms * UINT64_C(1000000))
+    uint64_t waited_ns = elapsed_ns(timeout_start_ns, now);
+    if (!now || waited_ns >= timeout_ms * UINT64_C(1000000))
       return false;
+    /* The session's generation is the low-contention compatibility observer.
+       A 1 us requested sleep avoids stealing scorer capacity while staying
+       below the previous 50 us polling quantum on common schedulers. */
     nanosleep(&pause, NULL);
   }
 }
@@ -338,7 +364,8 @@ static bool wait_for_idle(AsyncSession *session, uint64_t timeout_ms) {
     pthread_mutex_unlock(&session->score_req_mu);
     if (idle) return true;
     uint64_t now = monotonic_ns();
-    if (!now || now - start >= timeout_ms * UINT64_C(1000000)) return false;
+    if (!now || elapsed_ns(start, now) >= timeout_ms * UINT64_C(1000000))
+      return false;
     nanosleep(&pause, NULL);
   }
 }
@@ -457,8 +484,11 @@ static bool capture_round(AsyncSession *session, const Options *options,
                           RoundResult *round) {
   char *owned_query = strdup(query);
   if (!owned_query) return false;
-  uint64_t start = monotonic_ns();
-  if (!start) {
+  int initial_generation =
+      atomic_load_explicit(&session->gen, memory_order_acquire);
+  uint64_t timeout_start = monotonic_ns();
+  uint64_t start = measurement_tick();
+  if (!timeout_start || !start) {
     free(owned_query);
     return false;
   }
@@ -467,9 +497,10 @@ static bool capture_round(AsyncSession *session, const Options *options,
       options->case_mode, options->fuzzy,
       options->filter_only_query_length, options->filter_only_logic_and);
   if (!request_id || !wait_for_publication(session, request_id, pool,
-                                            options->timeout_ms, start))
+                                            options->timeout_ms, timeout_start,
+                                            initial_generation))
     return false;
-  uint64_t end = monotonic_ns();
+  uint64_t end = measurement_tick();
   if (!end || end < start) return false;
 
   size_t limit = 0, progress_completed = 0, progress_total = 0;
@@ -502,7 +533,7 @@ static bool capture_round(AsyncSession *session, const Options *options,
     return false;
   }
   round->request_id = request_id;
-  round->elapsed_ns = end - start;
+  round->elapsed_ns = elapsed_ns(start, end);
   round->matched = filtered;
   round->results = results;
   round->checksum = result_checksum(results, round->emitted);
