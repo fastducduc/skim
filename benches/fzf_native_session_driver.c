@@ -466,12 +466,14 @@ static bool capture_round(AsyncSession *session, const Options *options,
       &total, &allocation_failed);
   result_id = result_observation.request_id;
   round->pool = result_observation.pool_generation;
-  bool ok = result_id == request_id && !error && round->pool == pool &&
+  bool ok = result_id == request_id && result_filter &&
+            strcmp(result_filter, query) == 0 && !error &&
+            round->pool == pool &&
             total == pool && !allocation_failed &&
             (!round->emitted || results) &&
             progress_completed == progress_total &&
             case_mode == options->case_mode && fuzzy == options->fuzzy &&
-            (!limit || round->emitted <= limit);
+            limit == options->limit && (!limit || round->emitted <= limit);
   free(result_filter);
   free(error);
   if (!ok || !wait_for_idle(session, options->timeout_ms)) {

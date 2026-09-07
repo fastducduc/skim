@@ -1709,6 +1709,23 @@ fn native_hash_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+fn validate_native_driver_args(args: &[String]) -> Result<()> {
+    const BENCHMARK_OWNED_OPTIONS: [&str; 6] = [
+        "--input",
+        "--query",
+        "--queries",
+        "--limit",
+        "--workers",
+        "--timeout-ms",
+    ];
+    if let Some(option) = args.iter().find(|arg| BENCHMARK_OWNED_OPTIONS.contains(&arg.as_str())) {
+        return Err(invalid_data(format!(
+            "'{option}' is controlled by native-session and cannot be passed after '--'"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_native_protocol(
     output: &[u8],
     expected_items: u64,
@@ -1865,6 +1882,7 @@ fn cmd_native_session(args: &NativeSessionArgs) -> Result<()> {
     if args.runs == 0 {
         return Err(invalid_data("--runs must be greater than zero"));
     }
+    validate_native_driver_args(&args.driver_args)?;
     let driver = resolve_native_driver(args)?;
     let (input, _input_handle, item_count) = if let Some(ref path) = args.file {
         if !Path::new(path).is_file() {

@@ -51,6 +51,19 @@ run_rejection_test() {
 run_rejection_test query "round query hash does not match the requested query"
 run_rejection_test aggregate "completion aggregate checksum does not match the rounds"
 
+if FZF_NATIVE_CLI_FAKE_DRIVER_MODE=aggregate cargo bench --quiet --bench cli -- native-session \
+    --driver "$repo_dir/benches/test_fzf_native_cli.sh" -f "$work_dir/input.txt" -q test \
+    -w 0 -r 1 --limit 3 -- --input "$work_dir/input.txt" \
+    > "$work_dir/override.stdout" 2> "$work_dir/override.stderr"; then
+  echo "benchmark-owned input override unexpectedly succeeded" >&2
+  exit 1
+fi
+if [[ -s "$work_dir/override.stdout" ]]; then
+  echo "input override forwarded timing output" >&2
+  exit 1
+fi
+grep -q "controlled by native-session" "$work_dir/override.stderr"
+
 : > "$work_dir/empty.txt"
 if cargo bench --quiet --bench cli -- native-session \
     --driver "$repo_dir/benches/test_fzf_native_cli.sh" -f "$work_dir/empty.txt" \
