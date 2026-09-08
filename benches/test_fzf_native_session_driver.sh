@@ -17,9 +17,10 @@ grep -q '"event":"round".*"matched":0.*"verified":true' "$work_dir/success.jsonl
 grep -q '"event":"complete".*"verified":true' "$work_dir/success.jsonl"
 
 # Equal-score candidates use Unicode character length, not byte length, as
-# the default rank tiebreak.  The longer candidate comes first in the input so
-# successful verification also proves that the result was reordered.
-printf '%s\n' 'a界界' 'aé' zzz > "$work_dir/unicode-rank.txt"
+# the default rank tiebreak.  `abc` is longer by character count but shorter
+# by byte count than `a界`.  A byte-length rank would keep the input order,
+# while the correct character-length rank must move `a界` first.
+printf '%s\n' abc 'a界' zzz > "$work_dir/unicode-rank.txt"
 "$driver" --input "$work_dir/unicode-rank.txt" --query a --workers 1 \
   --limit 0 > "$work_dir/unicode-rank.jsonl"
 grep -q '"event":"round".*"matched":2,"emitted":2.*"filter_only":false.*"verified":true' \
