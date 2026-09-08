@@ -392,7 +392,12 @@ static uint64_t result_checksum(const ScoredStr *results, size_t count) {
 static int reference_cmp(const void *left, const void *right) {
   const ScoredStr *a = left;
   const ScoredStr *b = right;
-  if (a->score != b->score) return a->score > b->score ? -1 : 1;
+  if (a->rank.score != b->rank.score)
+    return a->rank.score > b->rank.score ? -1 : 1;
+  if (a->rank.first != b->rank.first)
+    return a->rank.first < b->rank.first ? -1 : 1;
+  if (a->rank.second != b->rank.second)
+    return a->rank.second < b->rank.second ? -1 : 1;
   if (a->idx != b->idx) return a->idx < b->idx ? -1 : 1;
   return 0;
 }
@@ -417,7 +422,10 @@ static bool verify_round(AsyncSession *session, const Options *options,
   }
   fzf_slab_t *slab = fzf_make_default_slab();
   ScoredStr *reference = malloc(round->pool * sizeof *reference);
-  if ((!slab && pattern) || (round->pool && !reference)) {
+  if ((!slab && pattern) ||
+      (slab && !fzf_slab_set_score_scheme(
+                   slab, FZF_SCORE_SCHEME_DEFAULT)) ||
+      (round->pool && !reference)) {
     free(mutable_query);
     if (pattern) fzf_free_pattern(pattern);
     if (slab) fzf_free_slab(slab);
@@ -427,15 +435,25 @@ static bool verify_round(AsyncSession *session, const Options *options,
 
   size_t matched = 0;
   bool matcher_allocation_failed = false;
+  bool can_reuse_public_score =
+      fzf_rank_can_reuse_public_score(
+          pattern, FZF_SCORE_SCHEME_DEFAULT);
   pthread_mutex_lock(&session->mu);
   for (size_t i = 0; i < round->pool; i++) {
     char *candidate = session->cands_top[i >> CANDS_BLOCK_SHIFT]
                                         [i & CANDS_BLOCK_MASK];
+    FzfRankKeys rank = {0};
+    size_t candidate_len = strlen(candidate);
+    bool input_is_ascii =
+        is_ascii_utf8proc(candidate, candidate_len);
     int score = !pattern
                     ? 1
                     : round->filter_only
                           ? (fzf_has_match(candidate, pattern, slab) ? 1 : 0)
-                          : fzf_get_score(candidate, pattern, slab);
+                          : fzf_score_and_rank(
+                                candidate, candidate_len, input_is_ascii,
+                                pattern, slab, FZF_SCORE_SCHEME_DEFAULT,
+                                can_reuse_public_score, &rank);
     if (pattern &&
         (fzf_allocation_failed() || verify_test_force_allocation_failure)) {
       matcher_allocation_failed = true;
@@ -443,7 +461,8 @@ static bool verify_round(AsyncSession *session, const Options *options,
     }
     if (score > 0)
       reference[matched++] = (ScoredStr){
-          .str = candidate, .score = score, .idx = (uint32_t)i};
+          .str = candidate, .score = score, .idx = (uint32_t)i,
+          .rank = rank};
   }
   pthread_mutex_unlock(&session->mu);
 
@@ -452,7 +471,13 @@ static bool verify_round(AsyncSession *session, const Options *options,
                        : matched;
   if (!matcher_allocation_failed && round->filter_only && pattern) {
     for (size_t i = 0; i < emitted; i++) {
-      reference[i].score = fzf_get_score(reference[i].str, pattern, slab);
+      size_t candidate_len = strlen(reference[i].str);
+      bool input_is_ascii =
+          is_ascii_utf8proc(reference[i].str, candidate_len);
+      reference[i].score = fzf_score_and_rank(
+          reference[i].str, candidate_len, input_is_ascii,
+          pattern, slab, FZF_SCORE_SCHEME_DEFAULT,
+          can_reuse_public_score, &reference[i].rank);
       if (fzf_allocation_failed() || verify_test_force_allocation_failure) {
         matcher_allocation_failed = true;
         break;
