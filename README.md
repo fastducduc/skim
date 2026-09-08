@@ -847,10 +847,11 @@ revision. They include a build ID from every fzf-native source input. This build
 ID also uses the working-tree contents. Record both values with each published
 measurement.
 
-The reference source is `fastducduc/fzf-native` branch
-`codex/benchmark-baseline-20260906`. Its commit is
-`ae3e3e1e8d737949455210f9304dc726ba0e51a1`. If a compiled file differs from
-this commit, the build ID changes.
+The base reference source is `dangduc/fzf-native` commit
+`b21edb6d2dbc38e3ca61f19cb2fac3c10a8c5eb2`. The driver requires the session
+and rank interfaces in this commit. It does not support the earlier
+`ae3e3e1e8d737949455210f9304dc726ba0e51a1` revision. If a compiled file differs
+from the selected commit, the build ID changes.
 
 You can also run the driver directly with a supplied query sequence. Use
 repeatable `--query` options or `--queries FILE`. A blank line in the file is an

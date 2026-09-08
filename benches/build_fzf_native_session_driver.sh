@@ -40,7 +40,13 @@ required=(
   fzf-additions.h
   fzf-private.h
   fzf.c
-  fzf-normalize.inc
+)
+if [[ -f "$source_dir/fzf.c" ]] &&
+    LC_ALL=C grep -Eq '^[[:space:]]*#[[:space:]]*include[[:space:]]*"fzf-normalize\.inc"' \
+      "$source_dir/fzf.c"; then
+  required+=(fzf-normalize.inc)
+fi
+required+=(
   fzf-score-input.inc
   utf8_char_index.h
   utf8proc-2.10.0/utf8proc.c
