@@ -18,8 +18,9 @@ grep -q '"event":"complete".*"verified":true' "$work_dir/success.jsonl"
 
 # Equal-score candidates use Unicode character length, not byte length, as
 # the default rank tiebreak.  `abc` is longer by character count but shorter
-# by byte count than `a界`.  A byte-length rank would keep the input order,
-# while the correct character-length rank must move `a界` first.
+# by byte count than `a界`.  A byte-length rank or a false negative in the
+# session's sortability flag would keep the input order.  The independent
+# verifier must move `a界` first.
 printf '%s\n' abc 'a界' zzz > "$work_dir/unicode-rank.txt"
 "$driver" --input "$work_dir/unicode-rank.txt" --query a --workers 1 \
   --limit 0 > "$work_dir/unicode-rank.jsonl"
@@ -49,6 +50,43 @@ for limit in 0 1 3; do
   if [[ "$limit" != 0 ]]; then emitted="$limit"; fi
   grep -q "\"event\":\"round\".*\"matched\":4,\"emitted\":$emitted.*\"filter_only\":true.*\"verified\":true" \
     "$work_dir/filter-limit-$limit.jsonl"
+done
+
+# Filter-only membership uses the full scorer as independent evidence.  A
+# false positive and a false negative cannot cancel through an equal count.
+printf '%s\n' alpha zzz > "$work_dir/filter-membership.txt"
+"$driver" --input "$work_dir/filter-membership.txt" --query a --workers 1 \
+  --limit 0 --filter-only-min-pool 1 \
+  > "$work_dir/filter-membership.jsonl"
+grep -q '"event":"round".*"matched":1,"emitted":1.*"filter_only":true.*"verified":true' \
+  "$work_dir/filter-membership.jsonl"
+
+# The short-query threshold counts Unicode characters.  This one-character
+# query has three UTF-8 bytes, so a byte-count regression disables the mode.
+printf '%s\n' '你好' other > "$work_dir/unicode-threshold.txt"
+"$driver" --input "$work_dir/unicode-threshold.txt" --query '你' --workers 1 \
+  --limit 0 --filter-only-min-pool 0 --filter-only-query-length 1 \
+  > "$work_dir/unicode-threshold.jsonl"
+grep -q '"event":"round".*"matched":1,"emitted":1.*"filter_only":true.*"verified":true' \
+  "$work_dir/unicode-threshold.jsonl"
+
+# Empty queries preserve producer order in normal and forced filter-only mode.
+# Cover unlimited, one-result, and bounded multi-result publication.
+printf '%s\n' longword b middle xray > "$work_dir/empty-query.txt"
+for limit in 0 1 3; do
+  emitted=4
+  if [[ "$limit" != 0 ]]; then emitted="$limit"; fi
+  "$driver" --input "$work_dir/empty-query.txt" --query '' --workers 1 \
+    --limit "$limit" --filter-only-min-pool 0 \
+    > "$work_dir/empty-normal-$limit.jsonl"
+  grep -q "\"event\":\"round\".*\"matched\":4,\"emitted\":$emitted.*\"filter_only\":false.*\"verified\":true" \
+    "$work_dir/empty-normal-$limit.jsonl"
+
+  "$driver" --input "$work_dir/empty-query.txt" --query '' --workers 1 \
+    --limit "$limit" --filter-only-min-pool 1 \
+    > "$work_dir/empty-filter-$limit.jsonl"
+  grep -q "\"event\":\"round\".*\"matched\":4,\"emitted\":$emitted.*\"filter_only\":true.*\"verified\":true" \
+    "$work_dir/empty-filter-$limit.jsonl"
 done
 
 ready_revision="$(grep '"event":"ready"' "$work_dir/success.jsonl" | sed -E 's/.*"source_revision":"([0-9a-f]{40})".*/\1/')"

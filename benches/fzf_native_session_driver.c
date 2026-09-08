@@ -412,6 +412,46 @@ static uint16_t verifier_score(int64_t score) {
   return score > UINT16_MAX ? UINT16_MAX : (uint16_t)score;
 }
 
+/* Keep request-policy checks independent from the session implementation.
+   Invalid UTF-8 bytes count as one character, as they do at the Emacs API. */
+static size_t verifier_character_count(const char *text, size_t byte_len) {
+  size_t offset = 0;
+  size_t count = 0;
+  while (offset < byte_len) {
+    utf8proc_int32_t codepoint = 0;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset,
+        (utf8proc_ssize_t)(byte_len - offset), &codepoint);
+    offset += width > 0 ? (size_t)width : 1;
+    count++;
+  }
+  return count;
+}
+
+static bool verifier_filter_only(size_t min_pool, size_t max_len,
+                                 bool logic_and, size_t query_len,
+                                 size_t pool_size) {
+  if (min_pool == 0 && max_len == 0) return false;
+  bool by_pool = min_pool > 0 && pool_size >= min_pool;
+  bool by_len = max_len > 0 && query_len <= max_len;
+  if (!logic_and) return by_pool || by_len;
+  if (min_pool == 0) by_pool = true;
+  if (max_len == 0) by_len = true;
+  return by_pool && by_len;
+}
+
+/* Derive the sorting rule from parsed term semantics.  Do not trust the
+   session's cached has_positive_term flag in the verification path. */
+static bool verifier_has_positive_term(const fzf_pattern_t *pattern) {
+  if (!pattern) return false;
+  for (size_t i = 0; i < pattern->size; i++) {
+    const fzf_term_set_t *set = pattern->ptr[i];
+    for (size_t j = 0; j < set->size; j++)
+      if (!set->ptr[j].inv) return true;
+  }
+  return false;
+}
+
 /* Count Unicode scalar values after trimming edge whitespace.  An invalid
    UTF-8 byte counts as one value, which matches fzf's byte-preserving input
    behavior without calling the module's rank implementation. */
@@ -471,10 +511,10 @@ static int reference_cmp(const void *left, const void *right) {
 
 static bool verify_round(AsyncSession *session, const Options *options,
                          const char *query, const RoundResult *round) {
-  bool expected_filter_only = decide_filter_only(
+  bool expected_filter_only = verifier_filter_only(
       options->filter_only_min_pool, options->filter_only_query_length,
       options->filter_only_logic_and,
-      utf8_character_count(query, strlen(query)), round->pool);
+      verifier_character_count(query, strlen(query)), round->pool);
   if (round->filter_only != expected_filter_only) return false;
 
   char *mutable_query = *query ? strdup(query) : NULL;
@@ -502,7 +542,7 @@ static bool verify_round(AsyncSession *session, const Options *options,
 
   size_t matched = 0;
   bool matcher_allocation_failed = false;
-  bool sortable = pattern && pattern->has_positive_term;
+  bool sortable = verifier_has_positive_term(pattern);
   pthread_mutex_lock(&session->mu);
   for (size_t i = 0; i < round->pool; i++) {
     char *candidate = session->cands_top[i >> CANDS_BLOCK_SHIFT]
@@ -511,7 +551,7 @@ static bool verify_round(AsyncSession *session, const Options *options,
     int score = !pattern
                     ? 1
                     : round->filter_only
-                          ? (fzf_has_match(candidate, pattern, slab) ? 1 : 0)
+                          ? fzf_get_score(candidate, pattern, slab)
                           : verifier_score_and_rank(
                                 candidate, pattern, slab, &rank);
     if (pattern &&
@@ -519,10 +559,18 @@ static bool verify_round(AsyncSession *session, const Options *options,
       matcher_allocation_failed = true;
       break;
     }
-    if (score > 0)
+    if (score > 0) {
+      /* Production filter-only workers publish a match sentinel.  Use the
+         full scorer only as independent membership evidence, then model the
+         sentinel until the emitted window is explicitly ranked below. */
+      if (round->filter_only) {
+        score = 1;
+        rank = (FzfRankKeys){0};
+      }
       reference[matched++] = (ScoredStr){
           .str = candidate, .score = score, .idx = (uint32_t)i,
           .rank = rank};
+    }
   }
   pthread_mutex_unlock(&session->mu);
 
