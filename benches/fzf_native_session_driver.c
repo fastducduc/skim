@@ -389,6 +389,73 @@ static uint64_t result_checksum(const ScoredStr *results, size_t count) {
   return hash;
 }
 
+/* Keep the verification rank separate from the module's private rank
+   helpers.  The benchmark must catch an error in those helpers instead of
+   reproducing it in the oracle.  This list is the Unicode White_Space set
+   used by fzf when it computes the default tiebreak length. */
+static bool verifier_is_space(utf8proc_int32_t codepoint) {
+  return (codepoint >= 0x09 && codepoint <= 0x0d) ||
+         codepoint == 0x20 || codepoint == 0x85 || codepoint == 0xa0 ||
+         codepoint == 0x1680 ||
+         (codepoint >= 0x2000 && codepoint <= 0x200a) ||
+         codepoint == 0x2028 || codepoint == 0x2029 ||
+         codepoint == 0x202f || codepoint == 0x205f ||
+         codepoint == 0x3000;
+}
+
+static uint16_t verifier_u16(size_t value) {
+  return value > UINT16_MAX ? UINT16_MAX : (uint16_t)value;
+}
+
+static uint16_t verifier_score(int64_t score) {
+  if (score <= 0) return 0;
+  return score > UINT16_MAX ? UINT16_MAX : (uint16_t)score;
+}
+
+/* Count Unicode scalar values after trimming edge whitespace.  An invalid
+   UTF-8 byte counts as one value, which matches fzf's byte-preserving input
+   behavior without calling the module's rank implementation. */
+static size_t verifier_trimmed_length(const char *text) {
+  size_t text_len = strlen(text);
+  size_t offset = 0, rune_index = 0;
+  size_t first_nonspace = SIZE_MAX, last_nonspace = 0;
+  while (offset < text_len) {
+    utf8proc_int32_t codepoint = 0;
+    utf8proc_ssize_t width = utf8proc_iterate(
+        (const utf8proc_uint8_t *)text + offset,
+        (utf8proc_ssize_t)(text_len - offset), &codepoint);
+    if (width <= 0) {
+      codepoint = (unsigned char)text[offset];
+      width = 1;
+    }
+    if (!verifier_is_space(codepoint)) {
+      if (first_nonspace == SIZE_MAX) first_nonspace = rune_index;
+      last_nonspace = rune_index;
+    }
+    offset += (size_t)width;
+    rune_index++;
+  }
+  return first_nonspace == SIZE_MAX
+             ? 0
+             : last_nonspace - first_nonspace + 1;
+}
+
+/* Use only the public bounds API for score evidence.  Default fzf ranking
+   orders by the unclamped aggregate score, then by Unicode-trimmed length.
+   The published score remains the API's positive match sentinel or score. */
+static int verifier_score_and_rank(const char *text, fzf_pattern_t *pattern,
+                                   fzf_slab_t *slab, FzfRankKeys *rank) {
+  fzf_score_bounds_t bounds = {0};
+  int score = fzf_get_score_with_bounds(text, pattern, slab, &bounds);
+  if (score > 0 && rank) {
+    *rank = (FzfRankKeys){
+        .score = verifier_score(bounds.raw_score),
+        .first = verifier_u16(verifier_trimmed_length(text)),
+    };
+  }
+  return score;
+}
+
 static int reference_cmp(const void *left, const void *right) {
   const ScoredStr *a = left;
   const ScoredStr *b = right;
@@ -435,25 +502,18 @@ static bool verify_round(AsyncSession *session, const Options *options,
 
   size_t matched = 0;
   bool matcher_allocation_failed = false;
-  bool can_reuse_public_score =
-      fzf_rank_can_reuse_public_score(
-          pattern, FZF_SCORE_SCHEME_DEFAULT);
+  bool sortable = pattern && pattern->has_positive_term;
   pthread_mutex_lock(&session->mu);
   for (size_t i = 0; i < round->pool; i++) {
     char *candidate = session->cands_top[i >> CANDS_BLOCK_SHIFT]
                                         [i & CANDS_BLOCK_MASK];
     FzfRankKeys rank = {0};
-    size_t candidate_len = strlen(candidate);
-    bool input_is_ascii =
-        is_ascii_utf8proc(candidate, candidate_len);
     int score = !pattern
                     ? 1
                     : round->filter_only
                           ? (fzf_has_match(candidate, pattern, slab) ? 1 : 0)
-                          : fzf_score_and_rank(
-                                candidate, candidate_len, input_is_ascii,
-                                pattern, slab, FZF_SCORE_SCHEME_DEFAULT,
-                                can_reuse_public_score, &rank);
+                          : verifier_score_and_rank(
+                                candidate, pattern, slab, &rank);
     if (pattern &&
         (fzf_allocation_failed() || verify_test_force_allocation_failure)) {
       matcher_allocation_failed = true;
@@ -469,15 +529,11 @@ static bool verify_round(AsyncSession *session, const Options *options,
   size_t emitted = options->limit && options->limit < matched
                        ? options->limit
                        : matched;
-  if (!matcher_allocation_failed && round->filter_only && pattern) {
+  if (!matcher_allocation_failed && round->filter_only && sortable &&
+      emitted > 1) {
     for (size_t i = 0; i < emitted; i++) {
-      size_t candidate_len = strlen(reference[i].str);
-      bool input_is_ascii =
-          is_ascii_utf8proc(reference[i].str, candidate_len);
-      reference[i].score = fzf_score_and_rank(
-          reference[i].str, candidate_len, input_is_ascii,
-          pattern, slab, FZF_SCORE_SCHEME_DEFAULT,
-          can_reuse_public_score, &reference[i].rank);
+      reference[i].score = verifier_score_and_rank(
+          reference[i].str, pattern, slab, &reference[i].rank);
       if (fzf_allocation_failed() || verify_test_force_allocation_failure) {
         matcher_allocation_failed = true;
         break;
@@ -485,7 +541,7 @@ static bool verify_round(AsyncSession *session, const Options *options,
     }
     if (!matcher_allocation_failed)
       qsort(reference, emitted, sizeof *reference, reference_cmp);
-  } else if (!matcher_allocation_failed) {
+  } else if (!matcher_allocation_failed && !round->filter_only && sortable) {
     qsort(reference, matched, sizeof *reference, reference_cmp);
   }
 

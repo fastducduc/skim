@@ -40,6 +40,7 @@ required=(
   fzf-additions.h
   fzf-private.h
   fzf.c
+  fzf-normalize.inc
   fzf-score-input.inc
   utf8_char_index.h
   utf8proc-2.10.0/utf8proc.c
